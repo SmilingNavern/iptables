@@ -8,3 +8,5 @@ It uses base file /etc/iptables to base confguration distrubition.
 You can save persistent custom rules for one server in /etc/iptables.d directory(with extension ".ipt")
 and have temporary rules(for example docker rules).
 You can reapply iptables rules without losing custom temporary rules.
+
+Powered by LTD BeGet.
