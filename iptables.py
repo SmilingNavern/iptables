@@ -1,5 +1,5 @@
 #!/usr/local/bin/pythonbrew-python27-system
-
+import shlex
 import subprocess
 import tempfile
 import argparse
@@ -7,15 +7,31 @@ import os
 import glob
 import sys
 import re
+import fcntl
 
 XTABLES_MULTI = '/usr/local/sbin/xtables-multi'
 TABLES = ["filter", "nat", "raw", "mangle"]
+
 CUSTOM_DIR = "/etc/iptables.d"
+CUSTOM_NAME_PATTERN = r'[\-\w]+'
+
+LOCK_FILE = "/var/run/iptables.lock"
+_LOCK_FILE = None
+
+
+def ensure_single_process():
+    global _LOCK_FILE, LOCK_FILE
+    _LOCK_FILE = open(LOCK_FILE, 'w')
+    try:
+        fcntl.flock(_LOCK_FILE, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except IOError:
+        sys.stderr.write("Another process is already running. Aborting." + os.linesep)
+        sys.exit(1)
 
 
 def get_args():
-    parser = argparse.ArgumentParser(description="ALL HAIL IPTABLES")
-    parser.add_argument("-t", "--table", type=str, help="tables(default: %s)" % TABLES)
+    parser = argparse.ArgumentParser(description="IPTABLES HELPER")
+    parser.add_argument("-t", "--table", type=str, help="tables(default: {})".format(TABLES))
     parser.add_argument("-c", "--chain", type=str, default=None, help="Specific chain for list rules")
     mex_group = parser.add_mutually_exclusive_group()
     mex_group.add_argument("-l", "--list-rules", dest="list_rules", action="store_true", help="show iptables")
@@ -25,36 +41,95 @@ def get_args():
     return args
 
 
-def get_temp_file(t_prefix):
-    t_file = tempfile.NamedTemporaryFile("w+b", prefix=t_prefix, dir='/tmp')
+def get_tmp_file(prefix):
+    tmp_file = tempfile.NamedTemporaryFile("w+b", prefix=prefix, dir='/tmp')
+    return tmp_file
 
-    return t_file
 
-
-def get_custom_rules():
+def get_custom_files():
+    """
+    Get custom files with custom rules
+    :return:
+    :rtype: list
+    """
     if not os.path.isdir(CUSTOM_DIR):
         return []
 
-    custom_rules = glob.glob(CUSTOM_DIR + "/*.ipt")
-    return custom_rules
+    custom_files = glob.glob(CUSTOM_DIR + "/*.ipt")
+
+    valid_files = []
+    for path in custom_files:
+        name = os.path.basename(path)
+        if re.match(r'^{}\.ipt$'.format(CUSTOM_NAME_PATTERN), name):
+            valid_files.append(path)
+        else:
+            sys.stderr.write("WARNING: invalid file name: {}".format(path) + os.linesep)
+
+    return valid_files
 
 
-def restore_custom_rules(custom_rules):
-    for r in custom_rules:
-        with open(r, "r+") as f:
-            name_f = os.path.basename(r).split(".")[0]
-            data = [i.rstrip() for i in f.readlines()]
-            t_file = open(get_temp_file(name_f).name, "w+b")
-            p_data = prepare_data(data, " -m comment --comment CUSTOMRULE_%s" % name_f)
-            for line in p_data:
-                t_file.write(line + "\n")
-            t_file.seek(0)
-            cmd = [XTABLES_MULTI, 'iptables-restore', "-n"]
-            subprocess.call(cmd, stdin=t_file)
-            t_file.close()
+def restore_custom_files(tables):
+    """
+    Restore rules from custom files
+    :param tables:
+    :param list custom_files: custom files with rules
+    :return:
+    """
+    restore_cmd = [XTABLES_MULTI, 'iptables-restore', '--noflush']
+    custom_files = get_custom_files()
+
+    # prepare custom rules
+    custom_rules = {}
+    for filepath in custom_files:
+        rule_name = os.path.basename(filepath).split(".")[0]
+        rule_comment = "-m comment --comment CUSTOMRULE_{}".format(rule_name)
+
+        with open(filepath, "r+") as f:
+            rules = [i.rstrip() for i in f.readlines()]
+
+        rules = prepare_rules(rules, rule_comment)
+
+        custom_rules[rule_name] = {
+            'comment': rule_comment,
+            'rules': rules,
+            'path': filepath,
+        }
+
+    # apply custom rules
+    failed_files = []
+    for rule_name, data in custom_rules.items():
+        tmp_file = get_tmp_file(rule_name)
+
+        with open(tmp_file.name, "w+b") as f:
+            for rule in data['rules']:
+                f.write(rule + os.linesep)
+            try:
+                # test new rules
+                f.seek(0)
+                subprocess.check_output(restore_cmd + ['--test'], stdin=f, stderr=subprocess.PIPE)
+
+                # apply new rules
+                f.seek(0)
+                subprocess.check_output(restore_cmd, stdin=f, stderr=subprocess.PIPE)
+            except Exception as e:
+                sys.stderr.write("- unable to restore: {} ({})".format(rule_name, e) + os.linesep)
+                failed_files.append(data['path'])
+
+    if failed_files:
+        sys.stderr.write("FAILED CUSTOM FILES: {}".format(failed_files) + os.linesep)
+        sys.exit(1)
+    else:
+        print("RESTORE CUSTOM RULES: SUCCESS")
 
 
-def get_table(table, ipt_rules):
+def get_table_rules(table, ipt_rules):
+    """
+    Extract table specific rules from given rules
+    :param str table:
+    :param list ipt_rules:
+    :return: table specific rules
+    :rtype: list
+    """
     start = 0
     table_rules = []
 
@@ -79,26 +154,46 @@ def get_table(table, ipt_rules):
 
 
 def is_base_rule(line):
-    line = line.split()
+    """
+    Match base rule by comment
+    :param basestring line:
+    :return:
+    """
+    # match --comment BASERULE
+    re_str = r'\s+--comment\s+BASERULE'
+    re_str += r'(?:\s+|\s*$)'  # end of string or spaces
 
-    return "--comment" in line and "BASERULE" in line
-
-
-def is_custom_rule(line):
-    # match --comment CUSTOMRULE_<some_name_here>
-    m = re.search(r'\s+--comment\s+CUSTOMRULE(?:_\w+)?(?:\s+|\s*$)', line)
-
+    m = re.search(re_str, line)
     return m
 
 
-def remove_comments(line):
+def is_custom_rule(line, name=None):
+    """
+    Match custom rule by comment
+    :param basestring line:
+    :param basestring name:
+    :return:
+    """
+    # match --comment CUSTOMRULE_<some_name_here>
+    re_str = r'\s+--comment\s+CUSTOMRULE'
+    if name is None:
+        re_str += r'(?:_({}))?'.format(CUSTOM_NAME_PATTERN)  # match _[a-z0-9_-] symbols
+    else:
+        re_str += r'_({})'.format(re.escape(name))
+    re_str += r'(?:\s+|\s*$)'  # end of string or spaces
+
+    m = re.search(re_str, line)
+    return m
+
+
+def remove_comment(line):
     """match --comment <WORDS>
     or match --comment '<WORDS>'
     or match --comment "<WORDS>"
     and replace it with ""
     """
     comment_patterns = [
-        r"""\s+--comment\s+(?:\w+|'[^']+'|"[^"]+")(?:\s+|\s*$)""",
+        r"""\s+--comment\s+(?:\S+|'[^']+'|"[^"]+")(?:\s+|\s*$)""",
         r'\s+\-m\s+comment(?:\s+|\s*$)']
 
     for p in comment_patterns:
@@ -131,33 +226,54 @@ def get_chain_name(line):
     return line.split()[0].lstrip(':')
 
 
-def get_curr_iptables():
-    tmp_iptables_file = get_temp_file('iptables-tmp')
+def get_runtime_rules():
+    """
+    Return iptables-save output as lines
+    :rtype: list
+    """
+    tmp_iptables_file = get_tmp_file('iptables-tmp')
     with open(tmp_iptables_file.name, "w+") as f:
         cmd = [XTABLES_MULTI, 'iptables-save']
         try:
             subprocess.check_call(cmd, stdout=f)
         except Exception as e:
-            print "Can't get current iptables"
-            print "Error: %s" % e
+            sys.stderr.write("Cannot get runtime iptables rules: {}".format(e) + os.linesep)
             sys.exit(1)
 
-    return tmp_iptables_file
+    rules = [i.rstrip() for i in tmp_iptables_file.readlines()]
+    return rules
 
 
-def get_base_iptables():
+def get_base_rules():
+    """
+    Get base rules from /etc/iptables
+    :rtype: list
+    """
     iptables_path = "/etc/iptables"
 
-    return iptables_path
+    with open(iptables_path, "r+") as f:
+        rules = [i.rstrip() for i in f.readlines()]
+
+    rules = prepare_rules(rules, "-m comment --comment BASERULE")
+    return rules
 
 
-def merge_rules(ipt_table_1, ipt_table_2, table_type):
+def merge_rules(base_rules, runtime_rules, table):
+    """
+    Merge runtime rules with base rules for given table
+    :param list base_rules:
+    :param list runtime_rules:
+    :param str table:
+    :return: merged rules
+    :rtype: list
+    """
     merged_rules = []
     chains = []
 
-    merged_rules.append("*%s" % table_type)
+    merged_rules.append("*{}".format(table))
 
-    for line in ipt_table_2:
+    # filter runtime rules to skip managed ones
+    for line in runtime_rules:
         if is_base_rule(line):
             continue
         elif is_custom_rule(line):
@@ -172,7 +288,8 @@ def merge_rules(ipt_table_1, ipt_table_2, table_type):
         else:
             merged_rules.append(line)
 
-    for line in ipt_table_1:
+    # add base rules
+    for line in base_rules:
         if is_chain(line):
             chain_name = get_chain_name(line)
             if not chain_name in chains:
@@ -202,49 +319,66 @@ def is_rule(line):
     return True
 
 
-def prepare_data(data, comment):
-    prepared_data = []
-    for line in data:
-        if is_rule(line):
-            line = remove_comments(line)
-            prepared_data.append(line + comment)
-        else:
-            prepared_data.append(line)
-
-    return prepared_data
+def prepare_rules(rules, comment):
+    """
+    Replace comment in rules with given one
+    :param list rules: iptables rules
+    :param str comment: new comment
+    :return:
+    """
+    prepared_rules = []
+    for rule in rules:
+        if is_rule(rule):
+            rule = remove_comment(rule)
+            rule = '{} {}'.format(rule, comment)
+        prepared_rules.append(rule)
+    return prepared_rules
 
 
 def restore_rules(tables):
-    tmp_cur_iptables = get_curr_iptables()
-    tmp_base_iptables = get_base_iptables()
-    ipt_restore_tmp = get_temp_file("tmp-ipt-restore")
+    """
+    Restore all rules from files
+    :param tables: iptables table names
+    :return:
+    """
+    ensure_single_process()
 
-    with open(tmp_base_iptables, "r+") as f:
-        base_ipt_data = [i.rstrip() for i in f.readlines()]
+    restore_base_file(tables)
+    restore_custom_files(tables)
 
-    tmp_ipt_data = [i.rstrip() for i in tmp_cur_iptables.readlines()]
-    base_ipt_data = prepare_data(base_ipt_data, " -m comment --comment BASERULE")
 
-    for t in tables:
-        base_table = get_table(t, base_ipt_data)
-        tmp_table = get_table(t, tmp_ipt_data)
-        with open(ipt_restore_tmp.name, "a+b") as f:
-            for line in merge_rules(base_table, tmp_table, t):
-                f.write(line + '\n')
+def restore_base_file(tables):
+    """
+    Restore rules from base file (drops all custom rules)
+    :param tables:
+    :return:
+    """
+    runtime_rules = get_runtime_rules()
+    base_rules = get_base_rules()
 
-    with open(ipt_restore_tmp.name, "r+") as f:
+    tmp_file = get_tmp_file("tmp-ipt-restore")
+
+    with open(tmp_file.name, "w+b") as f:
+        for table in tables:
+            table_base_rules = get_table_rules(table, base_rules)
+            tables_runtime_rules = get_table_rules(table, runtime_rules)
+            for rule in merge_rules(table_base_rules, tables_runtime_rules, table):
+                f.write(rule + os.linesep)
+
+        f.seek(0)
         cmd = [XTABLES_MULTI, 'iptables-restore']
         retcode = subprocess.call(cmd, stdin=f)
 
     if retcode == 0:
-        print "RESTORE BASE RULE: SUCCESS"
-
-    custom_rules = get_custom_rules()
-    if custom_rules:
-        restore_custom_rules(custom_rules)
+        print("RESTORE BASE RULES: SUCCESS")
 
 
 def show_rules(table):
+    """
+    Display runtime rules
+    :param table:
+    :return:
+    """
     extra_args = []
 
     if table:
@@ -252,6 +386,21 @@ def show_rules(table):
 
     cmd = [XTABLES_MULTI, 'iptables-save']
     subprocess.call(cmd + extra_args)
+
+
+def remove_runtime_rule(table, rule):
+    """
+    Remove given rule from runtime
+    :param basestring table:
+    :param basestring rule:
+    :return:
+    """
+    cmd = [XTABLES_MULTI, 'iptables', '-t', table, '-D']
+
+    tokens = shlex.split(rule)
+    assert(tokens[0].startswith('-'))
+
+    subprocess.check_call(cmd + tokens[1:])
 
 
 def show_rules_list(table, chain):
